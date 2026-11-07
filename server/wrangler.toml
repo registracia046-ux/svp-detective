@@ -1,0 +1,25 @@
+# Общая комната «Системного Детектива» — Worker + KV + Durable Object.
+# Публикация: bash deploy.sh (нужен вход в Cloudflare: npx wrangler login)
+
+name = "svp-room"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Пространство KV с картинками и описаниями предметов.
+# id проставляет deploy.sh автоматически после создания пространства.
+[[kv_namespaces]]
+binding = "ROOM"
+id = "ЗАМЕНИТЬ_НА_ID_ПРОСТРАНСТВА"
+
+# Durable Object считает загрузки за сутки атомарно:
+# пачка параллельных запросов не обходит лимит.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter"]
+
+# Секрет администратора задаётся отдельно:
+#   npx wrangler secret put ROOM_ADMIN_TOKEN
