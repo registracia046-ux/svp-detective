@@ -112,12 +112,13 @@ console.log("2. загрузка картинки");
 let uploadedId = null;
 {
   const e = env("secret");
-  const r = await call(e, "/item", uploadForm(PNG, "a.png", "image/png", { x: 0.3, y: 0.4, w: 0.25, author: "Гость", vector: "Уретральный" }));
+  const r = await call(e, "/item", uploadForm(PNG, "a.png", "image/png", { x: 0.3, y: 0.4, w: 0.25, author: "Гость", vector: "Уретральный", kind: "piece" }));
   check("POST /item отвечает 200", r.status === 200, r.body);
   check("item.id на месте", !!(r.body.item && r.body.item.id), r.body);
   check("тип распознан как png", r.body.item && r.body.item.type === "png", r.body.item);
   check("подпись сохранена", r.body.item && r.body.item.author === "Гость", r.body.item);
   check("автору выдан личный ключ", typeof r.body.secret === "string" && r.body.secret.length >= 16, r.body.secret);
+  check("тип предмета сохранён", r.body.item.kind === "piece", r.body.item.kind);
   check("личный ключ не попал в список комнаты", !("secret" in r.body.item), r.body.item);
   uploadedId = r.body.item.id;
 

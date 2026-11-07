@@ -148,6 +148,7 @@ function indexKey(meta) {
     w: meta.w,
     a: meta.author,
     v: meta.vector,
+    k: meta.kind,
     s: meta.secret,
     c: meta.createdAt
   });
@@ -169,6 +170,7 @@ function readIndexKey(name) {
       w: meta.w,
       author: meta.a || "",
       vector: meta.v || "",
+      kind: meta.k === "piece" ? "piece" : "photo",
       secret: meta.s || "",
       createdAt: meta.c,
       url: "/media/" + parts[1]
@@ -189,6 +191,7 @@ function publicItem(item) {
     w: item.w,
     author: item.author,
     vector: item.vector,
+    kind: item.kind || "photo",
     createdAt: item.createdAt,
     url: item.url
   };
@@ -315,6 +318,7 @@ async function handleUpload(request, env) {
     w: clampNumber(form.get("w"), 0.06, 0.7, 0.22),
     author: cleanText(form.get("author"), 28),
     vector: cleanText(form.get("vector"), 28),
+    kind: cleanText(form.get("kind"), 8) === "piece" ? "piece" : "photo",
     secret: crypto.randomUUID().replace(/-/g, "").slice(0, 24),
     createdAt: Date.now()
   };
