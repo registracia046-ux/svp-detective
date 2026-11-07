@@ -1439,6 +1439,7 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
           <h2 class="headline text-[2.4rem] leading-[1.1] text-mist sm:text-[3.25rem]">Общая комната</h2>
           <p class="lede mt-5 max-w-[54ch] leading-relaxed text-dim">Здесь каждый гость оставляет свою картинку: фотографию, гифку, открытку. Предмет появляется в комнате и остаётся в ней, пока его не уберут.</p>
           <p class="lede mt-3 max-w-[54ch] text-sm leading-relaxed text-dim">Картинка уезжает в общее хранилище сайта и видна всем, кто открывает пособие. В комнате видно всё, что выложили, поэтому личное сюда класть не стоит.</p>
+          <p class="lede mt-3 max-w-[54ch] text-sm leading-relaxed text-dim">Пока сервер комнаты не подключён, картинку можно поставить, подвинуть и выгрузить в PNG, но увидят её только вы, не все гости.</p>
           <div class="mt-8 flex flex-wrap gap-3">
             <button type="button" id="room-add" class="btn btn-primary">
               <i class="fa-solid fa-plus" aria-hidden="true"></i>
@@ -3310,7 +3311,6 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
   function addFiles(fileList) {
     var files = Array.prototype.slice.call(fileList || []);
     if (!files.length) { return; }
-    if (!ROOM_API) { status("Комната ждёт подключения сервера."); return; }
     var accepted = files.filter(function (file) { return ACCEPT.indexOf(file.type) !== -1 && file.size <= MAX_BYTES; });
     var skipped = files.length - accepted.length;
     if (!accepted.length) {
@@ -3334,7 +3334,8 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     });
     Promise.all(pending).then(function () {
       renderDrafts();
-      status(skipped ? "Готово. Часть файлов пропущена: нужен png, jpeg, gif, webp или avif до 8 МБ." : "Готово. Поставьте картинку и нажмите «Показать всем».");
+      var local = ROOM_API ? "" : " Общая комната ждёт подключения сервера: картинка стоит только у вас, показать её всем пока нельзя.";
+      status((skipped ? "Готово. Часть файлов пропущена: нужен png, jpeg, gif, webp или avif до 8 МБ." : "Готово. Поставьте картинку и нажмите «Показать всем».") + local);
     });
   }
 
@@ -3354,12 +3355,18 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
         status(items.length ? "В комнате предметов: " + items.length + ". Обновление каждые 12 секунд." : "Комната пуста. Будьте первым.");
       }
     }).catch(function (error) {
-      status(error.message === "offline" ? "Комната ждёт подключения сервера." : "Сервер комнаты сейчас недоступен. Попробуйте позже.");
+      status(error.message === "offline"
+        ? "Общая комната ждёт подключения сервера: картинки можно ставить и скачивать PNG, показывать их всем заработает позже."
+        : "Сервер комнаты сейчас недоступен. Попробуйте позже.");
     });
   }
 
   function publish() {
     if (!drafts.length) { return; }
+    if (!ROOM_API) {
+      status("Общая комната ждёт подключения сервера. Картинку можно поставить и скачать PNG, показать её всем заработает после подключения.");
+      return;
+    }
     if (!consentBox || !consentBox.checked) {
       status("Отметьте согласие на публичный показ, чтобы выложить картинку.");
       return;
@@ -3500,7 +3507,6 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
 
     if (addBtn) {
       addBtn.addEventListener("click", function () {
-        if (!ROOM_API) { status("Комната ждёт подключения сервера."); return; }
         if (fileInput) { fileInput.click(); }
       });
     }
