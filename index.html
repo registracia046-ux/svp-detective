@@ -664,6 +664,10 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
   transform: translateY(-2px);
 }
 .room-cat-item img { width: 100%; height: 100%; object-fit: contain; }
+.room-item.is-missing {
+  background: rgb(var(--c-panel) / 0.6);
+  box-shadow: none;
+}
 .room-item.is-piece {
   border: 0;
   background: transparent;
@@ -3308,6 +3312,10 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     img.alt = draft ? "своя картинка" : ("картинка гостя" + (item.author ? ": " + item.author : ""));
     img.draggable = false;
     img.src = mediaUrl(item);
+    img.addEventListener("error", function () {
+      img.remove();
+      node.classList.add("is-missing");
+    });
     node.appendChild(img);
     var tag = document.createElement("span");
     tag.className = "room-tag";
