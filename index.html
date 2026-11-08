@@ -3296,7 +3296,11 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     mqttSocket.onmessage = function (event) { mqttIncoming(event.data); };
     mqttSocket.onclose = function () {
       mqttReady = false;
+      status("Связь с общей комнатой прервалась. Пробуем восстановить…");
       setTimeout(function () { mqttOpen(); }, 4000);
+    };
+    mqttSocket.onerror = function () {
+      mqttReady = false;
     };
     setInterval(function () {
       if (mqttSocket && mqttSocket.readyState === 1) { mqttSocket.send(new Uint8Array([0xc0, 0x00])); }
@@ -4089,8 +4093,8 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
       loadState(false);
       timer = window.setInterval(function () { loadState(true); }, POLL_MS);
     } else {
+      status("Соединяемся с общей комнатой…");
       mqttOpen();
-      status("Общая комната на связи. Выложите картинку или предмет.");
     }
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden) { loadState(true); }

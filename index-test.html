@@ -3049,7 +3049,7 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
 
   function withdrawOwn(id, node) {
     if (!ROOM_API) {
-      var target = mqttStore[id];
+      var target = mqttMeta[id];
       if (!target) { return; }
       removeFromMqtt(target);
       if (node && node.parentNode) { node.parentNode.removeChild(node); }
@@ -3087,22 +3087,25 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
 
   /* --- общий режим без сервера: MQTT через публичный брокер ---
      Сообщения лежат в топиках и сохраняются брокером:
-       <топик>/list      список предметов
-       <топик>/item/<id> сам предмет вместе с картинкой
-     Картинка едет внутри сообщения, поэтому сторонний хостинг не нужен. */
+       <топик>/item/<id>      описание предмета (координаты, автор, число частей)
+       <топик>/chunk/<id>/<n> кусок картинки в base64
+     Картинка едет внутри сообщений, поэтому сторонний хостинг не нужен.
+     Список предметов держим для совместимости, но вид комнаты от него не зависит:
+     иначе при одновременной публикации двух гостей один перетирал список другого,
+     и предметы исчезали, хотя байты лежали в брокере. */
   var MQTT_URL = "wss://broker.hivemq.com:8884/mqtt";
   var MQTT_TOPIC = "svp-detective-room";
-  var MQTT_MAX_ITEM = 6500000;   // брокер держит 8 МБ на сообщение
   var MQTT_MAX_FILE = 5000000;    // предел исходного файла
   var MQTT_CHUNK = 512000;       // кусок base64 в одном сообщении
-  var MQTT_MAX_ITEMS = 40;       // сколько предметов живёт в комнате
+  var MQTT_MAX_ITEMS = 24;       // сколько предметов живёт в комнате
+  var MQTT_MAX_BYTES = 12000000; // весовой бюджет комнаты
   var mqttSocket = null;
   var mqttPacketId = 0;
   var mqttList = [];
-  var mqttStore = {};
-  var mqttChunks = {};
-  var mqttPending = {};
+  var mqttMeta = {};    // описания предметов: id -> описание
+  var mqttChunks = {};  // куски картинок: id -> { часть: текст }
   var mqttReady = false;
+  var mqttBroken = {};  // id предметов с битым приёмом
 
   function mqttLength(value) {
     var out = [];
@@ -3182,16 +3185,18 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
   function mqttReceive(topic, payload) {
     var text = "";
     for (var i = 0; i < payload.length; i++) { text += String.fromCharCode(payload[i]); }
+
     if (topic === MQTT_TOPIC + "/list") {
       try { mqttList = JSON.parse(text) || []; } catch (e) { mqttList = []; }
       return;
     }
-    var prefix = MQTT_TOPIC + "/item/";
-    if (topic.indexOf(prefix) === 0) {
-      var id = topic.slice(prefix.length);
+
+    var itemPrefix = MQTT_TOPIC + "/item/";
+    if (topic.indexOf(itemPrefix) === 0) {
+      var id = topic.slice(itemPrefix.length);
       if (!text) {
-        delete mqttStore[id];
-        delete mqttPending[id];
+        // предмет снят: гасим и его куски
+        delete mqttMeta[id];
         delete mqttChunks[id];
         mqttCollect();
         return;
@@ -3199,11 +3204,12 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
       try {
         var meta = JSON.parse(text);
         if (!meta || !meta.id) { return; }
-        mqttPending[id] = meta;
+        mqttMeta[id] = meta;
       } catch (e) { return; }
       mqttTryAssemble(id);
       return;
     }
+
     var chunkPrefix = MQTT_TOPIC + "/chunk/";
     if (topic.indexOf(chunkPrefix) === 0) {
       var rest = topic.slice(chunkPrefix.length);
@@ -3211,53 +3217,62 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
       if (slash < 0) { return; }
       var chunkId = rest.slice(0, slash);
       var part = rest.slice(slash + 1);
+      if (!text) {
+        // кусок снят или сломан — предмет целиком не соберётся
+        if (mqttChunks[chunkId]) { delete mqttChunks[chunkId][part]; }
+        delete mqttMeta[chunkId];
+        mqttCollect();
+        return;
+      }
       if (!mqttChunks[chunkId]) { mqttChunks[chunkId] = {}; }
       mqttChunks[chunkId][part] = text;
       mqttTryAssemble(chunkId);
     }
   }
 
-  /** Подрезаем комнату, чтобы брокер не забивался бесконечными предметами. */
-  function mqttTrim() {
-    var keys = Object.keys(mqttStore);
-    if (keys.length <= MQTT_MAX_ITEMS) { return; }
-    var sorted = keys.map(function (k) { return mqttStore[k]; })
-      .sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
-    sorted.slice(0, sorted.length - MQTT_MAX_ITEMS).forEach(function (old) {
-      removeFromMqtt(old);
-    });
-  }
-
-  /** Собирает куски картинки обратно в data URL, когда пришли все части. */
+  /** Собирает куски в готовый предмет, когда пришли все части. */
   function mqttTryAssemble(id) {
-    var pending = mqttPending[id];
-    if (!pending) { return; }
-    if (pending.url) {
-      mqttStore[id] = pending;
-      delete mqttPending[id];
-      mqttCollect();
-      return;
-    }
-    if (!pending.parts) { return; }
+    var meta = mqttMeta[id];
+    if (!meta || !meta.parts) { return; }
     var parts = mqttChunks[id] || {};
-    var data = pending.head || "";
-    for (var i = 0; i < pending.parts; i++) {
+    var data = meta.head || "";
+    for (var i = 0; i < meta.parts; i++) {
       var piece = parts[String(i)];
       if (typeof piece !== "string") { return; }
       data += piece;
     }
     delete mqttChunks[id];
-    pending.url = data;
-    mqttStore[id] = pending;
-    delete mqttPending[id];
+    meta.url = data;
+    mqttMeta[id] = meta;
     mqttTrim();
     mqttCollect();
   }
 
+  /** Подрезаем комнату: и по числу предметов, и по весу — чтобы брокер не забивался. */
+  function mqttTrim() {
+    var ids = Object.keys(mqttMeta);
+    if (!ids.length) { return; }
+    var sorted = ids.map(function (k) { return mqttMeta[k]; })
+      .sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+    var total = 0;
+    sorted.forEach(function (item) { total += (item.url || "").length; });
+    var excess = [];
+    var count = sorted.length - MQTT_MAX_ITEMS;
+    var weight = total - MQTT_MAX_BYTES;
+    sorted.forEach(function (item) {
+      var size = (item.url || "").length;
+      if (count > 0) { excess.push(item); count -= 1; weight += size; return; }
+      if (weight > 0) { excess.push(item); weight -= size; }
+    });
+    excess.forEach(function (old) { removeFromMqtt(old); });
+  }
+
+  /** Готовые предметы в комнате — по порядку появления. */
   function mqttCollect() {
     var list = [];
-    Object.keys(mqttStore).forEach(function (id) {
-      if (mqttStore[id]) { list.push(mqttStore[id]); }
+    Object.keys(mqttMeta).forEach(function (id) {
+      var meta = mqttMeta[id];
+      if (meta && meta.url) { list.push(meta); }
     });
     list.sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
     items = list;
@@ -3281,7 +3296,11 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     mqttSocket.onmessage = function (event) { mqttIncoming(event.data); };
     mqttSocket.onclose = function () {
       mqttReady = false;
+      status("Связь с общей комнатой прервалась. Пробуем восстановить…");
       setTimeout(function () { mqttOpen(); }, 4000);
+    };
+    mqttSocket.onerror = function () {
+      mqttReady = false;
     };
     setInterval(function () {
       if (mqttSocket && mqttSocket.readyState === 1) { mqttSocket.send(new Uint8Array([0xc0, 0x00])); }
@@ -3308,7 +3327,6 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     if (type === "image/png") { return "image/png"; }
     if (type === "image/webp") { return "image/webp"; }
     if (type === "image/avif") { return "image/avif"; }
-    if (type === "image/jpeg") { return "image/jpeg"; }
     return "image/jpeg";
   }
 
@@ -3336,28 +3354,30 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
         parts: parts,
         head: head
       };
-      // куски с картинкой — отдельными retained-сообщениями
+      // куски картинки — отдельными retained-сообщениями
       for (var i = 0; i < parts; i++) {
         var piece = base64.slice(i * MQTT_CHUNK, (i + 1) * MQTT_CHUNK);
         mqttSend(MQTT_TOPIC + "/chunk/" + id + "/" + i, piece, true);
       }
-      // описание предмета — последним, чтобы собирать картинку после кусков
+      // описание — последним, чтобы собирать картинку после кусков
       mqttSend(MQTT_TOPIC + "/item/" + id, JSON.stringify(meta), true);
-      mqttPending[id] = meta;
-      mqttTryAssemble(id);
+      // автору предмет виден сразу, не дожидаясь эха от брокера
+      meta.url = head + base64;
+      mqttMeta[id] = meta;
+      mqttTrim();
+      mqttCollect();
       return meta;
     });
   }
 
   function removeFromMqtt(item) {
-    var meta = mqttPending[item.id] || mqttStore[item.id];
+    var meta = mqttMeta[item.id];
     var parts = (meta && meta.parts) || 0;
     for (var i = 0; i < parts; i++) {
       mqttSend(MQTT_TOPIC + "/chunk/" + item.id + "/" + i, "", true);
     }
     mqttSend(MQTT_TOPIC + "/item/" + item.id, "", true);
-    delete mqttStore[item.id];
-    delete mqttPending[item.id];
+    delete mqttMeta[item.id];
     delete mqttChunks[item.id];
     mqttCollect();
   }
@@ -4016,8 +4036,8 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
         renderDrafts();
         if (!ROOM_API) {
           var guest = guestName();
-          var mineMqtt = Object.keys(mqttStore).filter(function (id) { return mqttStore[id].author === guest; });
-          mineMqtt.forEach(function (id) { removeFromMqtt(mqttStore[id]); });
+          var mineMqtt = Object.keys(mqttMeta).filter(function (id) { return mqttMeta[id].author === guest; });
+          mineMqtt.forEach(function (id) { removeFromMqtt(mqttMeta[id]); });
           status(mineMqtt.length
             ? "Ваши предметы убраны из общей комнаты."
             : "Ваши неопубликованные картинки убраны.");
@@ -4073,8 +4093,8 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
       loadState(false);
       timer = window.setInterval(function () { loadState(true); }, POLL_MS);
     } else {
+      status("Соединяемся с общей комнатой…");
       mqttOpen();
-      status("Общая комната на связи. Выложите картинку или предмет.");
     }
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden) { loadState(true); }
