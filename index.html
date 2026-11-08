@@ -3092,11 +3092,15 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
      Картинка едет внутри сообщения, поэтому сторонний хостинг не нужен. */
   var MQTT_URL = "wss://broker.hivemq.com:8884/mqtt";
   var MQTT_TOPIC = "svp-detective-room";
-  var MQTT_MAX_ITEM = 180000;
+  var MQTT_MAX_ITEM = 6500000;   // брокер держит 8 МБ на сообщение
+  var MQTT_MAX_FILE = 5000000;    // предел исходного файла
+  var MQTT_CHUNK = 512000;       // кусок base64 в одном сообщении
   var mqttSocket = null;
   var mqttPacketId = 0;
   var mqttList = [];
   var mqttStore = {};
+  var mqttChunks = {};
+  var mqttPending = {};
   var mqttReady = false;
 
   function mqttLength(value) {
@@ -3186,14 +3190,50 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     if (topic.indexOf(prefix) === 0) {
       var id = topic.slice(prefix.length);
       if (!text) { delete mqttStore[id]; mqttCollect(); return; }
-      if (payload.length > MQTT_MAX_ITEM) { return; }
       try {
-        var item = JSON.parse(text);
-        if (!item || typeof item.url !== "string" || item.url.indexOf("data:image/") !== 0) { return; }
-        mqttStore[id] = item;
+        var meta = JSON.parse(text);
+        if (!meta || !meta.id) { return; }
+        mqttPending[id] = meta;
       } catch (e) { return; }
-      mqttCollect();
+      mqttTryAssemble(id);
+      return;
     }
+    var chunkPrefix = MQTT_TOPIC + "/chunk/";
+    if (topic.indexOf(chunkPrefix) === 0) {
+      var rest = topic.slice(chunkPrefix.length);
+      var slash = rest.indexOf("/");
+      if (slash < 0) { return; }
+      var chunkId = rest.slice(0, slash);
+      var part = rest.slice(slash + 1);
+      if (!mqttChunks[chunkId]) { mqttChunks[chunkId] = {}; }
+      mqttChunks[chunkId][part] = text;
+      mqttTryAssemble(chunkId);
+    }
+  }
+
+  /** Собирает куски картинки обратно в data URL, когда пришли все части. */
+  function mqttTryAssemble(id) {
+    var pending = mqttPending[id];
+    if (!pending) { return; }
+    if (pending.url) {
+      mqttStore[id] = pending;
+      delete mqttPending[id];
+      mqttCollect();
+      return;
+    }
+    if (!pending.parts) { return; }
+    var parts = mqttChunks[id] || {};
+    var data = pending.head || "";
+    for (var i = 0; i < pending.parts; i++) {
+      var piece = parts[String(i)];
+      if (typeof piece !== "string") { return; }
+      data += piece;
+    }
+    delete mqttChunks[id];
+    pending.url = data;
+    mqttStore[id] = pending;
+    delete mqttPending[id];
+    mqttCollect();
   }
 
   function mqttCollect() {
@@ -3219,41 +3259,44 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
     }, 25000);
   }
 
-  /** Сжимает картинку и кладёт в data URL, чтобы она влезла в сообщение. */
-  function shrinkToDataUrl(file) {
-    return new Promise(function (resolve) {
-      var url = URL.createObjectURL(file);
-      var img = new Image();
-      img.onload = function () {
-        var max = 1100;
-        var scale = Math.min(1, max / Math.max(img.width, img.height));
-        var canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(img.width * scale));
-        canvas.height = Math.max(1, Math.round(img.height * scale));
-        var ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        URL.revokeObjectURL(url);
-        var quality = 0.72;
-        var data = canvas.toDataURL("image/webp", quality);
-        while (data.length > MQTT_MAX_ITEM && quality > 0.32) {
-          quality -= 0.1;
-          data = canvas.toDataURL("image/webp", quality);
-        }
-        resolve(data);
+  /** Читает файл в base64 целиком, без пережатия: так гифка остаётся гифкой. */
+  function fileToBase64(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        var result = String(reader.result || "");
+        var comma = result.indexOf(",");
+        resolve(comma < 0 ? "" : result.slice(comma + 1));
       };
-      img.onerror = function () { URL.revokeObjectURL(url); resolve(""); };
-      img.src = url;
+      reader.onerror = function () { reject(new Error("read")); };
+      reader.readAsDataURL(file);
     });
+  }
+
+  function mimeOf(file) {
+    var type = (file && file.type) || "";
+    if (type === "image/gif") { return "image/gif"; }
+    if (type === "image/png") { return "image/png"; }
+    if (type === "image/webp") { return "image/webp"; }
+    if (type === "image/avif") { return "image/avif"; }
+    if (type === "image/jpeg") { return "image/jpeg"; }
+    return "image/jpeg";
   }
 
   function publishToMqtt(draft) {
     status("Отправляем в общую комнату…");
-    return shrinkToDataUrl(draft.file).then(function (dataUrl) {
-      if (!dataUrl) { throw new Error("image"); }
+    if (draft.file.size > MQTT_MAX_FILE) {
+      return Promise.reject(new Error("too-big"));
+    }
+    return fileToBase64(draft.file).then(function (base64) {
+      if (!base64) { throw new Error("image"); }
       var id = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-      var item = {
+      var mime = mimeOf(draft.file);
+      var parts = Math.max(1, Math.ceil(base64.length / MQTT_CHUNK));
+      var head = "data:" + mime + ";base64,";
+      var meta = {
         id: id,
-        type: "png",
+        type: mime,
         x: draft.x,
         y: draft.y,
         w: draft.w,
@@ -3261,22 +3304,36 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
         vector: draft.vector,
         kind: draft.piece ? "piece" : "photo",
         createdAt: Date.now(),
-        url: dataUrl
+        parts: parts,
+        head: head
       };
-      mqttSend(MQTT_TOPIC + "/item/" + id, JSON.stringify(item), true);
+      // куски с картинкой — отдельными retained-сообщениями
+      for (var i = 0; i < parts; i++) {
+        var piece = base64.slice(i * MQTT_CHUNK, (i + 1) * MQTT_CHUNK);
+        mqttSend(MQTT_TOPIC + "/chunk/" + id + "/" + i, piece, true);
+      }
+      // описание предмета — последним, чтобы собирать картинку после кусков
+      mqttSend(MQTT_TOPIC + "/item/" + id, JSON.stringify(meta), true);
+      mqttPending[id] = meta;
       mqttList.push(id);
       mqttSend(MQTT_TOPIC + "/list", JSON.stringify(mqttList), true);
-      mqttStore[id] = item;
-      mqttCollect();
-      return item;
+      mqttTryAssemble(id);
+      return meta;
     });
   }
 
   function removeFromMqtt(item) {
+    var meta = mqttPending[item.id] || mqttStore[item.id];
+    var parts = (meta && meta.parts) || 0;
+    for (var i = 0; i < parts; i++) {
+      mqttSend(MQTT_TOPIC + "/chunk/" + item.id + "/" + i, "", true);
+    }
     mqttSend(MQTT_TOPIC + "/item/" + item.id, "", true);
     mqttList = mqttList.filter(function (id) { return id !== item.id; });
     mqttSend(MQTT_TOPIC + "/list", JSON.stringify(mqttList), true);
     delete mqttStore[item.id];
+    delete mqttPending[item.id];
+    delete mqttChunks[item.id];
     mqttCollect();
   }
 
@@ -3761,8 +3818,10 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
       renderDrafts();
       status("Картинка в общей комнате. Её видят все.");
     }).catch(function (error) {
-      status(error.message === "rate"
-        ? "Дневной лимит загрузок исчерпан, попробуйте завтра."
+      status(error.message === "too-big"
+        ? "Файл слишком большой для общей комнаты: нужно до 5 МБ."
+        : error.message === "rate"
+          ? "Дневной лимит загрузок исчерпан, попробуйте завтра."
         : error.message === "full"
           ? "Комната заполнена, оператор освобождает место."
           : "Не удалось выложить картинку: " + error.message);
