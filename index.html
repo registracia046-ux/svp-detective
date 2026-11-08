@@ -3571,24 +3571,38 @@ dialog#share-dialog h3 { font-family: var(--font-display); font-weight: 700; }
 
   /** GIF: вырезаем комментарии и расширение приложения, где прячется XMP. */
   function scrubGif(bytes) {
+    if (bytes.length < 13) { return bytes; }
+    // 6 байт сигнатуры + 7 байт логического экрана
     var out = bytes.subarray(0, 13);
+    var packed = bytes[10];
     var offset = 13;
+    // глобальная палитра: 3 * 2^(N+1) байт, если установлен флаг
+    if (packed & 0x80) {
+      var tableSize = 3 * Math.pow(2, (packed & 0x07) + 1);
+      if (offset + tableSize > bytes.length) { return bytes; }
+      out = concatBytes(out, bytes.subarray(offset, offset + tableSize));
+      offset += tableSize;
+    }
     while (offset < bytes.length) {
       var marker = bytes[offset];
-      if (marker === 0x3b) { out = concatBytes(out, bytes.subarray(offset)); break; }
-      if (marker === 0x21) {
+      if (marker === 0x3b) {                    // конец файла
+        out = concatBytes(out, bytes.subarray(offset));
+        break;
+      }
+      if (marker === 0x21) {                    // расширение
         var label = bytes[offset + 1];
         var cursor = offset + 2;
         while (cursor < bytes.length && bytes[cursor] !== 0) {
           cursor += bytes[cursor] + 1;
         }
         cursor += 1;
+        // комментарий и application-расширение убираем, остальное оставляем
         var skip = label === 0xfe || label === 0xff;
         if (!skip) { out = concatBytes(out, bytes.subarray(offset, cursor)); }
         offset = cursor;
         continue;
       }
-      if (marker === 0x2c) {
+      if (marker === 0x2c) {                    // кадр изображения
         out = concatBytes(out, bytes.subarray(offset));
         break;
       }
